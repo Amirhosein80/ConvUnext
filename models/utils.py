@@ -47,10 +47,12 @@ class GELU(nn.Module):
         return x
 
 
-class Residual(nn.Module):
-    def __init__(self, block):
+class SoftGatedSkipConnection(nn.Module):
+    def __init__(self, block, dim):
         super().__init__()
         self.block = block
+        self.alphas = nn.Parameter(torch.ones(1, dim, 1, 1))
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        return x.clone() + self.block(x)
+        return (x.clone() * self.sigmoid(self.alphas)) + self.block(x)
