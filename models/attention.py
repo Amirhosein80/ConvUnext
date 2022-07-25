@@ -103,7 +103,6 @@ class Attention(nn.Module):
         self.alphas_1 = nn.Parameter(torch.ones(1, 1, dim))
         self.alphas_2 = nn.Parameter(torch.ones(1, 1, dim))
         self.alphas_3 = nn.Parameter(torch.ones(1, 1, dim))
-        self.sigmoid = nn.Sigmoid()
         self.peg = PEG(dim=dim)
         self.norm_1 = nn.LayerNorm(normalized_shape=dim)
         self.norm_2 = nn.LayerNorm(normalized_shape=dim)
@@ -128,14 +127,14 @@ class Attention(nn.Module):
         decoder = self._preprocess_input(decoder)
         if encoder is not None:
             encoder = self._preprocess_input(encoder)
-        decoder = (self.sigmoid(self.alphas_1) * decoder.clone()) + self.self_atten_1(q=decoder, k=decoder, v=decoder)
+        decoder = (self.alphas_1 * decoder.clone()) + self.self_atten_1(q=decoder, k=decoder, v=decoder)
         decoder = self.peg(decoder)
         decoder = self.norm_1(decoder)
         if encoder is not None:
-            decoder = (self.sigmoid(self.alphas_2) * decoder.clone()) + self.self_atten_2(q=decoder, k=encoder, v=encoder)
+            decoder = (self.alphas_2 * decoder.clone()) + self.self_atten_2(q=decoder, k=encoder, v=encoder)
         else:
-            decoder = (self.sigmoid(self.alphas_2) * decoder.clone()) + self.self_atten_2(q=decoder, k=decoder, v=decoder)
-        decoder = (self.sigmoid(self.alphas_3) * decoder.clone()) + self.mlp(decoder)
+            decoder = (self.alphas_2 * decoder.clone()) + self.self_atten_2(q=decoder, k=decoder, v=decoder)
+        decoder = (self.alphas_3 * decoder.clone()) + self.mlp(decoder)
         decoder = self.norm_2(decoder)
         return self._postprocess_output(decoder)
 
