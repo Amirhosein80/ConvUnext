@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops.misc import Permute
 from math import sqrt
-from utils import Residual
 
 
 class ScaledDotProduct(nn.Module):
@@ -50,7 +49,7 @@ class PEG(nn.Module):
         x = self.permute1(x)
         x = self.conv(x)
         x = self.permute2(x)
-        return x.view(B, B, C)
+        return x.view(B, N, C)
 
 
 class MultiHeadAttention(nn.Module):
@@ -75,12 +74,12 @@ class MultiHeadAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, mlp_dim=2):
+    def __init__(self, dim, mlp_dim_scale=2):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
-        self.linear1 = nn.Linear(dim, dim * mlp_dim)
+        self.linear1 = nn.Linear(dim, dim * mlp_dim_scale)
         self.gelu = nn.GELU()
-        self.linear2 = nn.Linear(dim * mlp_dim, dim)
+        self.linear2 = nn.Linear(dim * mlp_dim_scale, dim)
 
         nn.init.xavier_uniform_(self.linear1.weight)
         nn.init.normal_(self.linear1.bias, std=1e-6)
@@ -96,7 +95,49 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads, scale_dim, mlp_dim):
+    def __init__(self, dim, num_heads, scale_dim, mlp_dim_scale):
         super().__init__()
+        self.mlp = MLP(dim=dim, mlp_dim_scale=mlp_dim_scale)
         self.self_atten_1 = MultiHeadAttention(dim=dim, num_heads=num_heads, scale_dim=scale_dim)
         self.self_atten_2 = MultiHeadAttention(dim=dim, num_heads=num_heads, scale_dim=scale_dim)
+        self.alphas_1 = nn.Parameter(torch.ones(1, 1, dim))
+        self.alphas_2 = nn.Parameter(torch.ones(1, 1, dim))
+        self.alphas_3 = nn.Parameter(torch.ones(1, 1, dim))
+        self.sigmoid = nn.Sigmoid()
+        self.peg = PEG(dim=dim)
+        self.norm_1 = nn.LayerNorm(normalized_shape=dim)
+        self.norm_2 = nn.LayerNorm(normalized_shape=dim)
+        self.permute1 = Permute([0, 2, 3, 1])
+        self.permute2 = Permute([0, 3, 1, 2])
+
+    def _preprocess_input(self, x):
+        B, C, H, W = x.shape
+        x = self.permute1(x)
+        x = x.view(B, H * W, C)
+        return x
+
+    def _postprocess_output(self, x):
+        B, N, C = x.shape
+        H = int(sqrt(N))
+        W = N // H
+        x = x.view(B, H, W, C)
+        x = self.permute2(x)
+        return x
+
+    def forward(self, decoder, encoder=None):
+        decoder = self._preprocess_input(decoder)
+        if encoder is not None:
+            encoder = self._preprocess_input(encoder)
+        decoder = (self.sigmoid(self.alphas_1) * decoder.clone()) + self.self_atten_1(q=decoder, k=decoder, v=decoder)
+        decoder = self.peg(decoder)
+        decoder = self.norm_1(decoder)
+        if encoder is not None:
+            decoder = (self.sigmoid(self.alphas_2) * decoder.clone()) + self.self_atten_2(q=decoder, k=encoder, v=encoder)
+        else:
+            decoder = (self.sigmoid(self.alphas_2) * decoder.clone()) + self.self_atten_2(q=decoder, k=decoder, v=decoder)
+        decoder = (self.sigmoid(self.alphas_3) * decoder.clone()) + self.mlp(decoder)
+        decoder = self.norm_2(decoder)
+        return self._postprocess_output(decoder)
+
+
+
