@@ -1,18 +1,19 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision.ops.misc import Permute
+from torchvision.ops.stochastic_depth import StochasticDepth
 from math import sqrt
+from utils import LayerNormalization
 
 
 class ScaledDotProduct(nn.Module):
-    def __init__(self, dim, scale_dim):
+    def __init__(self, dim, num_heads):
         super().__init__()
-        self.q = nn.Linear(dim, dim // scale_dim)
-        self.k = nn.Linear(dim, dim // scale_dim)
-        self.v = nn.Linear(dim, dim)
+        self.q = nn.Linear(dim, dim // num_heads)
+        self.k = nn.Linear(dim, dim // num_heads)
+        self.v = nn.Linear(dim, dim // num_heads)
         self.sigmoid = nn.Sigmoid()
-        self.dim = sqrt(dim // scale_dim)
+        self.scale = sqrt(dim // num_heads)
 
         nn.init.xavier_uniform_(self.q.weight)
         nn.init.xavier_uniform_(self.k.weight)
@@ -25,9 +26,9 @@ class ScaledDotProduct(nn.Module):
         q = self.q(q)
         k = self.k(k)
         v = self.v(v)
-        z = torch.bmm(q, k.transpose(-1, -2))
-        z = self.sigmoid(z / self.dim)
-        z = self.bmm(z, v)
+        z = q @ k.transpose(-1, -2)
+        z = self.sigmoid(z / self.scale)
+        z = z @ v
         return z
 
 
@@ -53,14 +54,14 @@ class PEG(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, dim, num_heads, scale_dim):
+    def __init__(self, dim, num_heads):
         super().__init__()
         self.sdps = []
         self.pegs = []
         for i in range(num_heads):
-            self.sdps.append(ScaledDotProduct(dim=dim, scale_dim=scale_dim))
+            self.sdps.append(ScaledDotProduct(dim=dim, num_heads=num_heads))
         self.sdps = nn.ModuleList(self.sdps)
-        self.projector = nn.Linear(dim * num_heads, dim)
+        self.projector = nn.Linear(dim, dim)
         self.num_heads = num_heads
 
         nn.init.xavier_uniform_(self.projector.weight)
@@ -73,33 +74,61 @@ class MultiHeadAttention(nn.Module):
         return self.projector(torch.cat(_outs, dim=-1))
 
 
-class MLP(nn.Module):
-    def __init__(self, dim, mlp_dim_scale=2):
+class CNBlock(nn.Module):
+    def __init__(self, dim, kernel_size=7, padding=3, dilation=1, layer_scale=1e-6, stochastic_depth_prob=0.1):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.linear1 = nn.Linear(dim, dim * mlp_dim_scale)
-        self.gelu = nn.GELU()
-        self.linear2 = nn.Linear(dim * mlp_dim_scale, dim)
+        self.block = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=padding, dilation=dilation, groups=dim, bias=True),
+            Permute([0, 2, 3, 1]),
+            nn.LayerNorm(dim),
+            nn.Linear(in_features=dim, out_features=4 * dim, bias=True),
+            nn.GELU(),
+            nn.Linear(in_features=4 * dim, out_features=dim, bias=True),
+            Permute([0, 3, 1, 2]),
+        )
+        self.layer_scale = nn.Parameter(torch.ones(dim, 1, 1) * layer_scale)
+        self.alphas = nn.Parameter(torch.ones(1, dim, 1, 1))
+        self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
 
-        nn.init.xavier_uniform_(self.linear1.weight)
-        nn.init.normal_(self.linear1.bias, std=1e-6)
-        nn.init.xavier_uniform_(self.linear2.weight)
-        nn.init.normal_(self.linear2.bias, std=1e-6)
+    def forward(self, input):
+        result = self.layer_scale * self.block(input)
+        result = self.stochastic_depth(result)
+        result += input * self.alphas
+        return result
+
+
+class OverlapPatch(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = LayerNormalization(dim)
+        self.conv = nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1)
+        nn.init.kaiming_normal_(self.conv.weight)
+        nn.init.normal_(self.conv.bias, std=1e-6)
 
     def forward(self, x):
         x = self.norm(x)
-        x = self.linear1(x)
-        x = self.gelu(x)
-        x = self.linear2(x)
+        x = self.conv(x)
+        return x
+
+
+class UnPatch(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.ConvTranspose2d(dim, dim, kernel_size=2, stride=2)
+        nn.init.kaiming_normal_(self.conv.weight)
+        nn.init.normal_(self.conv.bias, std=1e-6)
+
+    def forward(self, x):
+        x = self.conv(x)
         return x
 
 
 class Attention(nn.Module):
     def __init__(self, dim, num_heads, scale_dim, mlp_dim_scale):
         super().__init__()
-        self.mlp = MLP(dim=dim, mlp_dim_scale=mlp_dim_scale)
-        self.self_atten_1 = MultiHeadAttention(dim=dim, num_heads=num_heads, scale_dim=scale_dim)
-        self.self_atten_2 = MultiHeadAttention(dim=dim, num_heads=num_heads, scale_dim=scale_dim)
+        self.head = CNBlock(dim=dim)
+        self.self_atten_1 = MultiHeadAttention(dim=dim, num_heads=num_heads)
+        self.self_atten_2 = MultiHeadAttention(dim=dim, num_heads=num_heads)
         self.alphas_1 = nn.Parameter(torch.ones(1, 1, dim))
         self.alphas_2 = nn.Parameter(torch.ones(1, 1, dim))
         self.alphas_3 = nn.Parameter(torch.ones(1, 1, dim))
@@ -134,9 +163,7 @@ class Attention(nn.Module):
             decoder = (self.alphas_2 * decoder.clone()) + self.self_atten_2(q=decoder, k=encoder, v=encoder)
         else:
             decoder = (self.alphas_2 * decoder.clone()) + self.self_atten_2(q=decoder, k=decoder, v=decoder)
-        decoder = (self.alphas_3 * decoder.clone()) + self.mlp(decoder)
         decoder = self.norm_2(decoder)
+        decoder = self._postprocess_output(decoder)
+        decoder = self.head(decoder)
         return self._postprocess_output(decoder)
-
-
-
